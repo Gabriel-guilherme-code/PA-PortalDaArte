@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { 
+  Image,
   StyleSheet, 
   View, 
   TextInput, 
@@ -9,12 +10,14 @@ import {
 } from 'react-native';
 import { Search, Bell, Settings, Sun, Moon } from 'lucide-react-native';
 import { useTheme } from './context/ThemeContext';
+import { useProfile } from './context/ProfileContext';
 
 export default function Header() {
   const [isMenuVisible, setIsMenuVisible] = useState(false);
   
   // Puxando o tema e a função de trocar tema do Contexto
   const { isLightMode, toggleTheme, theme } = useTheme();
+  const { profileImage } = useProfile();
   
   // Gerando os estilos baseados no tema atual
   const styles = getStyles(theme);
@@ -48,7 +51,14 @@ export default function Header() {
         </TouchableOpacity>
 
         <TouchableOpacity style={styles.userAvatar}>
-          <Text style={styles.userAvatarText}>U</Text>
+          {profileImage ? (
+            <Image
+              source={{ uri: profileImage }}
+              style={styles.userAvatarImage}
+            />
+          ) : (
+            <Text style={styles.userAvatarText}>U</Text>
+          )}
         </TouchableOpacity>
       </View>
 
@@ -165,6 +175,11 @@ const getStyles = (theme) => StyleSheet.create({
     color: '#FFFFFF',
     fontWeight: '700',
     fontSize: 14,
+  },
+  userAvatarImage: {
+    width: '100%',
+    height: '100%',
+    borderRadius: 16,
   },
   modalOverlay: {
     flex: 1,
