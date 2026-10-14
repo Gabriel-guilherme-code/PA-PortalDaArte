@@ -337,12 +337,12 @@ CREATE TABLE propostas (
     servico_id          BIGINT,
     descricao_escopo    TEXT NOT NULL,
     local_ou_modalidade VARCHAR(255),
-    prazo_estimado      DATE,
+    prazo_estimado      TIMESTAMP,
     valor_proposto      DECIMAL(10,2) NOT NULL,
     status              ENUM('em_negociacao', 'aceita', 'recusada', 'expirada')
                             NOT NULL DEFAULT 'em_negociacao',
-    criado_em           DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    atualizado_em       DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    criado_em           TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    atualizado_em       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
                                          ON UPDATE CURRENT_TIMESTAMP,
     CONSTRAINT fk_proposta_conversa FOREIGN KEY (conversa_id)
         REFERENCES conversas(id) ON DELETE CASCADE,
@@ -422,23 +422,82 @@ CREATE TABLE etapas_contrato (
 
 -- =========================================================
 -- DOMÍNIO: FINANCEIRO — HU19–HU21, HU41–HU44, HU58–HU59, HU63
+-- Inclui a integração de escrow/split via gateway (Asaas): a
+-- plataforma recebe o pagamento do contratante numa conta própria
+-- (master) e repassa automaticamente a parte do artista pra uma
+-- subconta dele no mesmo gateway, retendo a comissão.
 -- =========================================================
 
-CREATE TABLE pagamentos (
-    id                  BIGINT AUTO_INCREMENT PRIMARY KEY,
-    contrato_id         BIGINT NOT NULL,
-    etapa_id            BIGINT,
-    valor               DECIMAL(10,2) NOT NULL,
-    metodo_pagamento    ENUM('pix', 'cartao_credito', 'boleto') NOT NULL,
-    status              ENUM('pendente', 'processando', 'pago', 'recusado', 'estornado')
-                            NOT NULL DEFAULT 'pendente',
-    codigo_referencia   VARCHAR(255),     -- linha digitável do boleto, payload do QR Code, etc.
+-- A subconta do artista no gateway de pagamento — é pra onde o
+-- split manda o valor líquido de cada contratação. Um artista só
+-- recebe depois que essa conta existe e está ativa.
+CREATE TABLE contas_recebimento_artista (
+    artista_id                 BIGINT PRIMARY KEY,
+    gateway                    VARCHAR(30) NOT NULL DEFAULT 'asaas',
+    wallet_id                  VARCHAR(100) NOT NULL,   -- walletId: usado no "split" de cada cobrança
+    id_conta_gateway           VARCHAR(100),             -- id da subconta no gateway, se houver
+    -- A api key da subconta normalmente NÃO precisa ser guardada:
+    -- a plataforma opera o split com a própria chave mestra + wallet_id.
+    -- Se algum dia for mesmo necessário armazenar, isso tem que ir
+    -- cifrado (nunca em texto puro) — por isso o nome do campo.
+    api_key_cifrada            VARBINARY(512),
+    chave_pix                  VARCHAR(140),             -- chave usada para o saque automático
+    banco_codigo                VARCHAR(10),
+    banco_nome                  VARCHAR(100),
+    agencia                     VARCHAR(20),
+    conta                       VARCHAR(20),
+    conta_digito                 VARCHAR(5),
+    tipo_conta                  ENUM('corrente', 'poupanca') DEFAULT 'corrente',
+    transferencia_automatica    BOOLEAN NOT NULL DEFAULT FALSE,
+    status                      ENUM('pendente', 'ativa', 'rejeitada', 'bloqueada') NOT NULL DEFAULT 'pendente',
+    criado_em                   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    atualizado_em                DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                             ON UPDATE CURRENT_TIMESTAMP,
+    CONSTRAINT fk_conta_recebimento_artista FOREIGN KEY (artista_id)
+        REFERENCES perfis_artista(usuario_id) ON DELETE CASCADE,
+    CONSTRAINT uq_conta_recebimento_wallet UNIQUE (gateway, wallet_id)
+) ENGINE=InnoDB;
+
+-- O "cliente" do gateway que será cobrado — qualquer usuário pode
+-- precisar disso quando contrata (mesmo um artista contratando
+-- outro artista), por isso referencia usuarios, não contratante
+-- especificamente.
+CREATE TABLE clientes_pagamento (
+    usuario_id          BIGINT PRIMARY KEY,
+    gateway              VARCHAR(30) NOT NULL DEFAULT 'asaas',
+    id_cliente_gateway   VARCHAR(100) NOT NULL,
     criado_em           DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    pago_em             DATETIME,
+    CONSTRAINT fk_cliente_pagamento_usuario FOREIGN KEY (usuario_id)
+        REFERENCES usuarios(id) ON DELETE CASCADE,
+    CONSTRAINT uq_cliente_pagamento_gateway UNIQUE (gateway, id_cliente_gateway)
+) ENGINE=InnoDB;
+
+CREATE TABLE pagamentos (
+    id                       BIGINT AUTO_INCREMENT PRIMARY KEY,
+    contrato_id              BIGINT NOT NULL,
+    etapa_id                 BIGINT,
+    valor                    DECIMAL(10,2) NOT NULL,
+    valor_repassado_artista  DECIMAL(10,2),    -- parte que vai pro artista via split
+    valor_taxa_plataforma    DECIMAL(10,2),    -- comissão retida pela plataforma
+    metodo_pagamento         ENUM('pix', 'cartao_credito', 'boleto') NOT NULL,
+    status                   ENUM('pendente', 'processando', 'pago', 'recusado', 'estornado')
+                                 NOT NULL DEFAULT 'pendente',
+    gateway                  VARCHAR(30) NOT NULL DEFAULT 'asaas',
+    id_transacao_gateway     VARCHAR(100),      -- id da cobrança no gateway (ex: Asaas payment id)
+    id_cliente_gateway       VARCHAR(100),      -- snapshot de quem foi cobrado, no momento da cobrança
+    link_fatura_url          VARCHAR(255),      -- checkout hospedado pelo gateway (invoiceUrl)
+    codigo_referencia        VARCHAR(255),      -- linha digitável do boleto, payload do QR Code, etc.
+    criado_em                DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    pago_em                  DATETIME,
     CONSTRAINT fk_pagamento_contrato FOREIGN KEY (contrato_id)
         REFERENCES contratos(id) ON DELETE CASCADE,
     CONSTRAINT fk_pagamento_etapa FOREIGN KEY (etapa_id)
-        REFERENCES etapas_contrato(id) ON DELETE SET NULL
+        REFERENCES etapas_contrato(id) ON DELETE SET NULL,
+    CONSTRAINT uq_pagamento_transacao_gateway UNIQUE (gateway, id_transacao_gateway),
+    CONSTRAINT chk_pagamento_split CHECK (
+        valor_repassado_artista IS NULL OR valor_taxa_plataforma IS NULL
+        OR valor = valor_repassado_artista + valor_taxa_plataforma
+    )
 ) ENGINE=InnoDB;
 
 -- Log bruto de eventos do gateway de pagamento — HU72 (admin monitora integração)
@@ -606,6 +665,7 @@ CREATE INDEX idx_servicos_ativo               ON servicos(ativo);
 CREATE INDEX idx_propostas_status             ON propostas(status);
 CREATE INDEX idx_contratos_status             ON contratos(status);
 CREATE INDEX idx_pagamentos_status            ON pagamentos(status);
+CREATE INDEX idx_contas_recebimento_status    ON contas_recebimento_artista(status);
 CREATE INDEX idx_ocorrencias_status           ON ocorrencias(status);
 CREATE INDEX idx_ocorrencias_tipo             ON ocorrencias(tipo);
 CREATE INDEX idx_notificacoes_usuario_lida    ON notificacoes(usuario_id, lida);
